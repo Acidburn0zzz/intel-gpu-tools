@@ -40,6 +40,21 @@
 IGT_TEST_DESCRIPTION(
    "Use the display CRC support to validate mmap write to an already uncached future scanout buffer.");
 
+enum local_dma_buf_sync_flags {
+	LOCAL_DMA_BUF_SYNC_RW = (3 << 0),
+	LOCAL_DMA_BUF_SYNC_START = (0 << 2),
+	LOCAL_DMA_BUF_SYNC_END = (1 << 2),
+
+	LOCAL_DMA_BUF_SYNC_VALID_FLAGS_MASK = LOCAL_DMA_BUF_SYNC_RW |
+		LOCAL_DMA_BUF_SYNC_END
+};
+
+#define LOCAL_DMA_BUF_BASE 'b'
+#define LOCAL_DMA_BUF_IOCTL_SYNC _IOW(LOCAL_DMA_BUF_BASE, 0, struct local_dma_buf_sync)
+struct local_dma_buf_sync {
+	enum local_dma_buf_sync_flags flags;
+};
+
 typedef struct {
 	int drm_fd;
 	igt_display_t display;
@@ -67,7 +82,25 @@ static char *dmabuf_mmap_framebuffer(int drm_fd, struct igt_fb *fb)
 	return ptr;
 }
 
-static void test_begin_access(data_t *data)
+static void dmabuf_sync_start(void)
+{
+	struct local_dma_buf_sync sync_start;
+
+	memset(&sync_start, 0, sizeof(sync_start));
+	sync_start.flags = LOCAL_DMA_BUF_SYNC_START | LOCAL_DMA_BUF_SYNC_RW;
+	do_ioctl(dma_buf_fd, LOCAL_DMA_BUF_IOCTL_SYNC, &sync_start);
+}
+
+static void dmabuf_sync_end(void)
+{
+	struct local_dma_buf_sync sync_end;
+
+	memset(&sync_end, 0, sizeof(sync_end));
+	sync_end.flags = LOCAL_DMA_BUF_SYNC_END | LOCAL_DMA_BUF_SYNC_RW;
+	do_ioctl(dma_buf_fd, LOCAL_DMA_BUF_IOCTL_SYNC, &sync_end);
+}
+
+static void test(data_t *data)
 {
 	igt_display_t *display = &data->display;
 	igt_output_t *output = data->output;
@@ -103,14 +136,11 @@ static void test_begin_access(data_t *data)
 	caching = gem_get_caching(data->drm_fd, fb->gem_handle);
 	igt_assert(caching == I915_CACHING_NONE || caching == I915_CACHING_DISPLAY);
 
-	// Uncomment the following for flush and the crc check next passes. It
-	// requires the kernel counter-part of it implemented obviously.
-	// {
-	// struct dma_buf_sync sync_start;
-	// memset(&sync_start, 0, sizeof(sync_start));
-	// sync_start.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
-	// do_ioctl(dma_buf_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
-	// }
+	/*
+	 * firstly demonstrate the need for DMA_BUF_SYNC_START ("begin_cpu_access")
+	 */
+
+	dmabuf_sync_start();
 
 	/* use dmabuf pointer to make the other fb all white too */
 	buf = malloc(fb->size);
@@ -122,6 +152,38 @@ static void test_begin_access(data_t *data)
 	/* and flip to it */
 	igt_plane_set_fb(data->primary, fb);
 	igt_display_commit(display);
+
+	/* check that the crc is as expected, which requires that caches got flushed */
+	igt_pipe_crc_collect_crc(data->pipe_crc, &crc);
+	igt_assert_crc_equal(&crc, &data->ref_crc);
+
+	/*
+	 * now demonstrates the need for DMA_BUF_SYNC_END ("end_cpu_access")
+	 */
+
+	/* start over, writing non-white to the fb again and flip to it to make it
+	 * fully flushed */
+	cr = igt_get_cairo_ctx(data->drm_fd, fb);
+	igt_paint_test_pattern(cr, fb->width, fb->height);
+	cairo_destroy(cr);
+
+	igt_plane_set_fb(data->primary, fb);
+	igt_display_commit(display);
+
+	/* sync start, to move to CPU domain */
+	dmabuf_sync_start();
+
+	/* use dmabuf pointer in the same fb to make it all white */
+	buf = malloc(fb->size);
+	igt_assert(buf != NULL);
+	memset(buf, 0xff, fb->size);
+	memcpy(ptr, buf, fb->size);
+	free(buf);
+
+	/* there's an implicit flush in set_fb() as well (to set to the GTT domain),
+	 * so if we don't do it and instead write directly into the fb as it is the
+	 * scanout, that should demonstrate the need for end_cpu_access */
+	dmabuf_sync_end();
 
 	/* check that the crc is as expected, which requires that caches got flushed */
 	igt_pipe_crc_collect_crc(data->pipe_crc, &crc);
@@ -199,7 +261,7 @@ static void run_test(data_t *data)
 			if (!prepare_crtc(data))
 				continue;
 
-			test_begin_access(data);
+			test(data);
 			cleanup_crtc(data);
 
 			/* once is enough */
